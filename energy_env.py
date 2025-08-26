@@ -62,7 +62,7 @@ class SingleRobotEnergyEnv(gym.Env):
             self.pos[0] -= 1
         # action==0 means Stay (no movement)
 
-        # Energy consumption (Eq. 1 from doc)
+        # Energy consumption
         distance = 1 if action != 0 else 0
         energy_used = self.a * (self.load ** 2) * distance + self.b
         self.battery -= energy_used
