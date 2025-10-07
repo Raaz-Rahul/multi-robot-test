@@ -8,7 +8,7 @@ for the MultiRobotEnergyEnv base model.
 import os
 import numpy as np
 from tqdm import trange
-from multi_robot import MultiRobotEnergyEnv
+from energy_env_multi import MultiRobotEnergyEnv
 
 
 def greedy_action_towards(pos, dest):
