@@ -5,10 +5,19 @@ Generates demonstration data using a simple heuristic policy
 for the MultiRobotEnergyEnv base model.
 """
 
-import os
-import numpy as np
-from tqdm import trange
+import os, sys
+
+# --- Ensure repo root is on sys.path ---
+if "__file__" in globals():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+else:
+    repo_root = os.path.abspath("..")
+sys.path.append(repo_root)
+
+# --- Imports ---
 from energy_env_multi import MultiRobotEnergyEnv
+import numpy as np
+from tqdm import tqdm
 
 
 def greedy_action_towards(pos, dest):
