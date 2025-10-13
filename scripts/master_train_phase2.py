@@ -39,9 +39,10 @@ def generate_demos(n_episodes=200, max_steps=150, save_path="data/demos.npz"):
             obs = next_obs
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    np.savez(save_path, demos=demos)
+    np.savez(save_path, demos=np.array(demos, dtype=object))   # ✅ Fixed line
     print(f"✅ Demo generation complete — saved to {save_path}")
     return save_path
+
 
 
 # ==============================================================
