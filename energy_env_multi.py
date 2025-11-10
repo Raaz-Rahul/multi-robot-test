@@ -26,7 +26,7 @@ class MultiRobotEnergyEnv(gym.Env):
         self.battery_init = battery
         self.r_goal = float(r_goal)
         self.lambda_viol = float(lambda_viol)
-        self.debug = debug  # ✅ new flag
+        self.debug = debug  #  new flag
 
         # State per robot = [x, y, load, battery]
         self.observation_space = spaces.Box(
@@ -67,7 +67,7 @@ class MultiRobotEnergyEnv(gym.Env):
 
         total_energy = 0.0
         violated = False
-        violation_reasons = []  # ✅ track violations
+        violation_reasons = []  # track violations
 
         # Apply actions for each robot
         for i in range(self.n):
@@ -119,7 +119,7 @@ class MultiRobotEnergyEnv(gym.Env):
         reward = -total_energy
         if violated:
             reward -= self.lambda_viol
-            if self.debug:  # ✅ only print if debug enabled
+            if self.debug:  
                 print("Constraint violated:", ", ".join(violation_reasons))
         if all_delivered:
             reward += self.r_goal
@@ -128,15 +128,16 @@ class MultiRobotEnergyEnv(gym.Env):
         return self._get_state(), reward, terminated, truncated, {}
 
     def _get_state(self):
-        per_robot = []
+        s = []
         for i in range(self.n):
-            per_robot.extend([
-                float(self.pos[i, 0]),
-                float(self.pos[i, 1]),
-                float(self.load[i]),
-                float(self.battery[i])
-            ])
-        return np.array(per_robot, dtype=np.float32)
+            s.extend([
+                int(self.pos[i, 0]),                
+                int(self.pos[i, 1]),               
+                int(self.load[i]),                  
+                round(float(self.battery[i]), 2)    
+                ])
+        return np.array(s, dtype=object)
+
 
     def render(self):
         rows = []

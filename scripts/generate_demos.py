@@ -4,6 +4,8 @@ generate_demos.py
 Generates demonstration data using a simple heuristic policy
 for the MultiRobotEnergyEnv base model.
 """
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import os, sys
 
@@ -17,7 +19,12 @@ sys.path.append(repo_root)
 # --- Imports ---
 from energy_env_multi import MultiRobotEnergyEnv
 import numpy as np
+<<<<<<< Updated upstream
 from tqdm import tqdm
+=======
+from tqdm import trange
+from energy_env_multi import MultiRobotEnergyEnv
+>>>>>>> Stashed changes
 
 
 def greedy_action_towards(pos, dest):
