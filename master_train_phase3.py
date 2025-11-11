@@ -35,9 +35,11 @@ def generate_demos(num_episodes=200, max_steps=100, save_path="data/demos_phase3
             if done:
                 break
 
-    np.savez(save_path, demos=demos)
+    # ✅ Fix: Save using allow_pickle=True
+    np.savez(save_path, demos=np.array(demos, dtype=object))
     print(f"✅ Demo generation complete — saved to {save_path}")
     return save_path
+
 
 # -----------------------------------------------------------
 # 2️⃣ Behavior Cloning (BC) Network
@@ -117,3 +119,4 @@ if __name__ == "__main__":
     train_bc(demo_file)
     train_ppo_with_warmstart()
     print("\n🎯 Phase 3 Cooperative Training Completed Successfully!")
+
