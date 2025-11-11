@@ -47,12 +47,13 @@ class BCPolicy(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(BCPolicy, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
+            nn.Linear(input_dim, 64),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(64, 64),
             nn.ReLU(),
-            nn.Linear(128, output_dim)
+            nn.Linear(64, output_dim)
         )
+
 
     def forward(self, x):
         return self.net(x)
@@ -119,4 +120,5 @@ if __name__ == "__main__":
     train_bc(demo_file)
     train_ppo_with_warmstart()
     print("\n🎯 Phase 3 Cooperative Training Completed Successfully!")
+
 
