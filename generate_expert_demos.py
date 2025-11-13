@@ -11,7 +11,7 @@ def generate_demos(num_episodes=150, max_steps=200, save_path="data/demos_phase3
     """
     Generates expert demonstrations using simple cooperative rules:
     - Robots move toward destination
-    - Low-battery robots transfer load to nearest available robot
+    - Low-battery robots request load transfer
     """
 
     env = MultiRobotEnergyEnvPhase3(debug=False)
@@ -24,33 +24,34 @@ def generate_demos(num_episodes=150, max_steps=200, save_path="data/demos_phase3
         done = False
 
         for step in range(max_steps):
+
             # --------------------------------------
             # EXPERT POLICY (Handcrafted)
             # --------------------------------------
             actions = []
-            robot_states = obs.reshape(env.num_robots, 4)
+            robot_states = obs.reshape(env.n_robots, 4)   # <-- FIXED HERE
 
             for i, (x, y, load, battery) in enumerate(robot_states):
 
-                # Robot already delivered? stay still
+                # If robot already delivered → stay
                 if load == 0:
-                    actions.append(0)  # stay
+                    actions.append(0)
                     continue
 
-                # If battery low → allow transfer action
+                # If battery LOW (< 10) → request load transfer
                 if battery < 10:
-                    actions.append(5)  # ACTION 5 → Request load transfer
+                    actions.append(5)  # transfer action ID=5
                     continue
 
-                # Otherwise → move toward destination (grid-1, grid-1)
+                # Move toward destination (grid_size-1, grid_size-1)
                 dest_x, dest_y = env.grid_size - 1, env.grid_size - 1
 
                 if x < dest_x:
-                    actions.append(3)  # move east
+                    actions.append(3)  # east
                 elif y < dest_y:
-                    actions.append(1)  # move north
+                    actions.append(1)  # north
                 else:
-                    actions.append(0)  # at destination → stay
+                    actions.append(0)  # stay
 
             # Step environment
             next_obs, reward, done, trunc, info = env.step(actions)
@@ -59,10 +60,11 @@ def generate_demos(num_episodes=150, max_steps=200, save_path="data/demos_phase3
             demos.append((obs, actions, reward, next_obs))
 
             obs = next_obs
+
             if done:
                 break
 
-    # Convert to object array so numpy can save properly
+    # Save as object array
     demos = np.array(demos, dtype=object)
     np.savez(save_path, demos=demos)
 
