@@ -1,67 +1,176 @@
 # test_phase3_env.py
 """
-Evaluate Phase 3 PPO cooperative model.
-Prints deliveries, load-sharing, collisions, battery, rewards.
+Phase 3 environment tests:
+ - Observation structure
+ - Energy reward equation 
+ - Cooperative transfer logic
+ - Delivery logic
+ - Violations (battery, collision)
+ - PPO compatibility test
 """
 
-from stable_baselines3 import PPO
-from energy_env_phase3 import MultiRobotEnergyEnvPhase3
 import numpy as np
-import matplotlib.pyplot as plt
-import os
+from energy_env_phase3 import MultiRobotEnergyEnvPhase3
+from stable_baselines3 import PPO
 
-MODEL_PATH = "models/ppo_multi_robot_coop.zip"
-if not os.path.exists(MODEL_PATH):
-    MODEL_PATH = "models/ppo_multi_robot_coop"  # fallback
 
-if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError("❌ PPO model not found. Run master_train_phase3.py first.")
+def test_reset():
+    print("\n=== Test 1: Environment Reset ===")
+    env = MultiRobotEnergyEnvPhase3(debug=True)
+    obs, info = env.reset()
+    print("Initial observation:", obs)
 
-print(f"Loading PPO model from: {MODEL_PATH}")
-model = PPO.load(MODEL_PATH)
+    assert obs.shape[0] == env.n_robots * 5, \
+        "Observation dimension should be 5 features per robot"
+    print("PASS ✔ Reset and observation shape correct")
 
-env = MultiRobotEnergyEnvPhase3(debug=True)
-EPISODES = 5
-total_rewards = []
-battery_logs = []
 
-for ep in range(EPISODES):
+def test_reward_equation():
+    print("\n=== Test 2: Reward Formula ===")
+
+    env = MultiRobotEnergyEnvPhase3(debug=True, shaped_reward=False)
     obs, _ = env.reset()
-    done = False
-    ep_reward = 0
-    trace = []
-    step = 0
 
-    print(f"\n==================== Episode {ep+1} ====================")
+    actions = [0] * env.n_robots
+    new_obs, reward, done, trunc, info = env.step(actions)
 
-    while not done and step < 200:
-        action, _ = model.predict(obs, deterministic=True)
-        obs, reward, done, trunc, info = env.step(action.tolist())
-        ep_reward += reward
-
-        state_matrix = obs.reshape(env.n_robots, 4)
-        trace.append(state_matrix[:, 3])  # battery
-
-        print(f"Step {step} | Action={action.tolist()} | Reward={reward:.2f} | Done={done}")
-
-        step += 1
-
-    total_rewards.append(ep_reward)
-    battery_logs.append(np.array(trace))
-    print(f"Episode {ep+1} Total Reward = {ep_reward:.2f}")
-
-print("\n==================== Evaluation Complete ====================")
-print("Average Episode Reward:", np.mean(total_rewards))
-
-# PLOT BATTERY OF EP1
-if battery_logs:
-    b0 = battery_logs[0]
-    plt.figure(figsize=(8, 4))
+    # Expected energy cost:
+    # rt = -sum_i (a*(W^2)*d + b)
+    manual_cost = 0
     for i in range(env.n_robots):
-        plt.plot(b0[:, i], label=f"Robot {i}")
-    plt.xlabel("Steps")
-    plt.ylabel("Battery")
-    plt.title("Battery Consumption — Episode 1")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+        W = 1
+        d = 0
+        cost = env.a * (W ** 2) * d + env.b
+        manual_cost += cost
+
+    expected_reward = -manual_cost
+
+    print(f"Env reward: {reward:.3f} | Expected: {expected_reward:.3f}")
+    assert np.isclose(reward, expected_reward), "Reward formula mismatch"
+
+    print("PASS ✔ Reward equation matches")
+
+
+def test_transfer_logic():
+    print("\n=== Test 3: Cooperative Transfer ===")
+
+    env = MultiRobotEnergyEnvPhase3(enable_sharing=True, debug=True)
+    obs, _ = env.reset()
+
+    # Make robot 0 low battery, robot 1 high battery & idle
+    env.robots[0]["battery"] = 5
+    env.robots[1]["load"] = 0  # helper available
+
+    actions = [5, 0, 0]  # robot 0 requests transfer
+    new_obs, reward, done, trunc, info = env.step(actions)
+
+    print("Transfer info:", info["transfers"])
+    assert len(info["transfers"]) > 0, "No transfer happened"
+
+    print("PASS ✔ Transfer logic works")
+
+
+def test_delivery_logic():
+    print("\n=== Test 4: Delivery ===")
+
+    env = MultiRobotEnergyEnvPhase3(enable_sharing=False, debug=True)
+    obs, _ = env.reset()
+
+    # Teleport robot 0 to the destination with load = 1
+    r0 = env.robots[0]
+    dx, dy = r0["destination"]
+    r0["x"], r0["y"] = dx, dy
+    r0["load"] = 1
+
+    actions = [0, 0, 0]
+    _, reward, done, _, info = env.step(actions)
+
+    print("Deliveries:", info["deliveries"])
+    assert 0 in info["deliveries"], "Robot 0 should have delivered"
+
+    print("PASS ✔ Delivery logic works")
+
+
+def test_collision_violation():
+    print("\n=== Test 5: Collision Violation ===")
+
+    env = MultiRobotEnergyEnvPhase3(debug=True)
+    obs, _ = env.reset()
+
+    # Force collision: move robots to same coordinates
+    env.robots[0]["x"] = 0
+    env.robots[0]["y"] = 0
+    env.robots[1]["x"] = 0
+    env.robots[1]["y"] = 0
+
+    actions = [0, 0, 0]
+    _, reward, done, trunc, info = env.step(actions)
+
+    print("Violation reasons:", info["violation_reasons"])
+    assert "collision" in info["violation_reasons"], "Collision not detected!"
+
+    print("PASS ✔ Collision violation detected")
+
+
+def test_battery_violation():
+    print("\n=== Test 6: Battery Violation ===")
+
+    env = MultiRobotEnergyEnvPhase3(debug=True)
+    obs, _ = env.reset()
+
+    env.robots[0]["battery"] = -1  # force violation
+
+    actions = [0, 0, 0]
+    _, reward, done, trunc, info = env.step(actions)
+
+    print("Violation reasons:", info["violation_reasons"])
+    assert "battery_R0_neg" in info["violation_reasons"], "Battery violation not detected!"
+
+    print("PASS ✔ Battery violation detected")
+
+
+def test_phase2_energy_forecast_feature():
+    print("\n=== Test 7: Energy Forecast Feature Ehat ===")
+
+    env = MultiRobotEnergyEnvPhase3(debug=True)
+    obs, _ = env.reset()
+
+    obs = obs.reshape(env.n_robots, 5)
+    Ehat_values = obs[:, 4]
+
+    print("Ehat values:", Ehat_values)
+    assert np.all(Ehat_values > 0), "Ehat must be positive"
+
+    print("PASS ✔ Energy forecast feature exists and valid")
+
+
+def test_ppo_compatibility():
+    print("\n=== Test 8: PPO Compatibility ===")
+
+    env = MultiRobotEnergyEnvPhase3()
+    model = PPO("MlpPolicy", env, verbose=0)
+
+    obs, _ = env.reset()
+    action, _ = model.predict(obs)
+
+    new_obs, reward, done, trunc, info = env.step(action.tolist())
+
+    print("Step completed successfully.")
+    print("Action:", action)
+
+    print("PASS ✔ PPO can interact with Phase3 environment")
+
+
+if __name__ == "__main__":
+    test_reset()
+    test_reward_equation()
+    test_transfer_logic()
+    test_delivery_logic()
+    test_collision_violation()
+    test_battery_violation()
+    test_phase2_energy_forecast_feature()
+    test_ppo_compatibility()
+
+    print("\n====================")
+    print("All Phase-3 tests passed successfully.")
+    print("====================")
