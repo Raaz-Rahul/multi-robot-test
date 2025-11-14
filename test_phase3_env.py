@@ -13,7 +13,7 @@ from thesis_plots_phase3 import (
 #  Test Model on Phase 3 Cooperative Environment
 # ============================================================
 
-def run_phase3_evaluation(mmodel_path="models/ppo_cooperative_phase3"",
+def run_phase3_evaluation(mmodel_path="models/ppo_cooperative_phase3",
                           episodes=5,
                           max_steps=400,
                           debug=True):
