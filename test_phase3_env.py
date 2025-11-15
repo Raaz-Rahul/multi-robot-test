@@ -1,39 +1,59 @@
+"""
+Phase 3 Testing + Visualization Script
+"""
+
 import numpy as np
+import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
+
 from energy_env_phase3 import MultiRobotEnergyEnvPhase3
 
-
-def run_phase3_evaluation(episodes=3, max_steps=400):
-
-    model_path = "models/ppo_phase3.zip"
-    print(f"Loading PPO model: {model_path}")
-    model = PPO.load(model_path)
+def run_phase3_test(n_episodes=5):
+    print("\n🚀 Loading PPO Phase-3 Model...")
+    model = PPO.load("models/ppo_cooperative_phase3")
 
     env = MultiRobotEnergyEnvPhase3(debug=True)
 
-    for ep in range(episodes):
+    for ep in range(n_episodes):
         obs, _ = env.reset()
-        total_reward = 0
+        done = False
+        step = 0
 
-        print(f"\n=================== EPISODE {ep+1} =====================")
+        battery_history = []
+        deliveries = []
+        transfers = []
 
-        for t in range(max_steps):
-
+        while not done and step < 400:
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, _, info = env.step(action.tolist())
+            next_obs, reward, done, trunc, info = env.step(action.tolist())
 
-            total_reward += reward
+            robot_state = obs.reshape(env.n_robots, 4)
+            battery_history.append(robot_state[:, 3])
 
-            print(f"Step {t} | Action={action.tolist()} | Reward={reward:.2f} | Done={done}")
-            print(f"   Step info: transfers={info['transfers']}, deliveries={info['deliveries']}")
+            if "deliveries" in info and info["deliveries"]:
+                deliveries.append((step, info["deliveries"]))
 
-            if done:
-                break
+            if "transfers" in info and info["transfers"]:
+                transfers.append((step, info["transfers"]))
 
-        print(f"=== Episode {ep+1} finished in {t+1} steps | reward {total_reward:.2f} ===")
+            obs = next_obs
+            step += 1
 
-    print("\n==================== Evaluation Complete ====================\n")
+        print(f"\n=== Episode {ep+1} finished in {step} steps ===")
+        print(deliveries)
+        print(transfers)
+
+        # Plot energy chart
+        battery_history = np.array(battery_history)
+        plt.figure(figsize=(10,5))
+        for i in range(env.n_robots):
+            plt.plot(battery_history[:, i], label=f"Robot {i}")
+        plt.legend()
+        plt.title(f"Battery Consumption (Episode {ep+1})")
+        plt.xlabel("Time Step")
+        plt.ylabel("Battery")
+        plt.show()
 
 
 if __name__ == "__main__":
-    run_phase3_evaluation()
+    run_phase3_test()
