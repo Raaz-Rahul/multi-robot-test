@@ -1,59 +1,52 @@
-"""
-Phase 3 Testing + Visualization Script
-"""
-
+# test_phase3_env.py
 import numpy as np
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
-
 from energy_env_phase3 import MultiRobotEnergyEnvPhase3
 
-def run_phase3_test(n_episodes=5):
-    print("\n🚀 Loading PPO Phase-3 Model...")
-    model = PPO.load("models/ppo_cooperative_phase3")
-
+def evaluate(model_path="models/ppo_phase3", episodes=3, max_steps=400):
+    print("Loading model:", model_path)
+    model = PPO.load(model_path)
     env = MultiRobotEnergyEnvPhase3(debug=True)
 
-    for ep in range(n_episodes):
+    all_rewards = []
+
+    for ep in range(1, episodes+1):
         obs, _ = env.reset()
         done = False
-        step = 0
-
-        battery_history = []
+        t = 0
+        rewards = []
+        battery_log = []
         deliveries = []
         transfers = []
-
-        while not done and step < 400:
+        while not done and t < max_steps:
             action, _ = model.predict(obs, deterministic=True)
-            next_obs, reward, done, trunc, info = env.step(action.tolist())
-
-            robot_state = obs.reshape(env.n_robots, 4)
-            battery_history.append(robot_state[:, 3])
-
-            if "deliveries" in info and info["deliveries"]:
-                deliveries.append((step, info["deliveries"]))
-
-            if "transfers" in info and info["transfers"]:
-                transfers.append((step, info["transfers"]))
-
-            obs = next_obs
-            step += 1
-
-        print(f"\n=== Episode {ep+1} finished in {step} steps ===")
-        print(deliveries)
-        print(transfers)
-
-        # Plot energy chart
-        battery_history = np.array(battery_history)
-        plt.figure(figsize=(10,5))
-        for i in range(env.n_robots):
-            plt.plot(battery_history[:, i], label=f"Robot {i}")
-        plt.legend()
-        plt.title(f"Battery Consumption (Episode {ep+1})")
-        plt.xlabel("Time Step")
+            obs, reward, done, trunc, info = env.step(action.tolist())
+            rewards.append(reward)
+            states = obs.reshape(env.n_robots, 5)
+            battery_log.append(states[:, 3].copy())
+            if info.get("deliveries"):
+                deliveries.extend(info["deliveries"])
+            if info.get("transfers"):
+                transfers.extend(info["transfers"])
+            print(f"Step {t} | Action={action.tolist()} | Reward={reward:.2f} | Done={done}")
+            print(f"Step info: transfers={info.get('transfers',[])}, deliveries={info.get('deliveries',[])}")
+            t += 1
+        total = sum(rewards)
+        all_rewards.append(total)
+        battery_log = np.array(battery_log)
+        print(f"Episode {ep} finished in {t} steps | Total reward = {total:.2f}")
+        # plot battery
+        plt.figure(figsize=(8,4))
+        for r in range(env.n_robots):
+            plt.plot(battery_log[:, r], label=f"Robot {r}")
+        plt.title(f"Battery Trace — Episode {ep}")
+        plt.xlabel("Step")
         plt.ylabel("Battery")
+        plt.legend()
+        plt.grid()
         plt.show()
-
+    print("Avg reward:", np.mean(all_rewards))
 
 if __name__ == "__main__":
-    run_phase3_test()
+    evaluate()
