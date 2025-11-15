@@ -1,154 +1,102 @@
-"""
-Phase 3 Training Script – Cooperative Multi-Robot PPO with Imitation Warm Start
-Author: Rahul 
-
-This file:
-1. Loads Phase-3 environment
-2. Generates expert demonstrations
-3. Performs Behaviour-Cloning warm start
-4. Runs PPO fine-tuning
-5. Saves final model to /models/
-"""
-
+# master_train_phase3.py
 import os
 import numpy as np
-from tqdm import tqdm
+import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
-import gymnasium as gym
+from stable_baselines3.common.vec_env import DummyVecEnv
 
 from energy_env_phase3 import MultiRobotEnergyEnvPhase3
+from generate_expert_demos import generate_demos
 
-
-# ---------------------------------------------------------
-#  HELPER: Save demos safely (no shape errors)
-# ---------------------------------------------------------
-def save_fixed_demos(path, demos):
-    obs_list  = [d[0] for d in demos]
-    act_list  = [d[1] for d in demos]
-    rew_list  = [d[2] for d in demos]
-
-    np.savez(
-        path,
-        observations=np.array(obs_list, dtype=object),
-        actions=np.array(act_list, dtype=object),
-        rewards=np.array(rew_list, dtype=object)
-    )
-    print(f"Expert demos saved safely → {path}")
-
-
-# ---------------------------------------------------------
-#  PHASE 3 — Generate expert demonstrations
-# ---------------------------------------------------------
-def generate_expert_demos(n_episodes=200, max_steps=200):
-    env = MultiRobotEnergyEnvPhase3(debug=False)
-
-    demos = []
-    print("\nGenerating Expert Demos...")
-
-    for _ in tqdm(range(n_episodes), desc="Expert Trajectories"):
-        obs, _ = env.reset()
-        for _ in range(max_steps):
-            # Simple heuristic: robot moves toward destination greedily
-            actions = []
-            for r in range(env.n_robots):
-                x, y, load, battery = env.robots[r]["x"], env.robots[r]["y"], env.robots[r]["load"], env.robots[r]["battery"]
-                dx, dy = env.robots[r]["destination"]
-
-                if x < dx:  a = 3  # east
-                elif x > dx: a = 4  # west
-                elif y < dy: a = 1  # north
-                else: a = 0        # stay
-
-                actions.append(a)
-
-            next_obs, reward, done, trunc, info = env.step(actions)
-            demos.append((obs, actions, reward))
-            obs = next_obs
-            if done:
-                break
-
-    os.makedirs("data", exist_ok=True)
-    save_fixed_demos("data/phase3_demos.npz", demos)
-    return "data/phase3_demos.npz"
-
-
-# ---------------------------------------------------------
-#  PHASE 3 — Behaviour Cloning warm-start
-# ---------------------------------------------------------
-def warm_start_with_bc(env, demo_file):
-    print("\nBC Warm Start Started...")
-
-    data = np.load(demo_file, allow_pickle=True)
+def train_bc_on_policy(policy, demo_path, epochs=3, lr=1e-3, batch_size=64):
+    """
+    Perform supervised updates on PPO policy network using demo data.
+    policy: model.policy (a Stable-Baselines policy object)
+    """
+    data = np.load(demo_path, allow_pickle=True)
     obs_arr = data["observations"]
     act_arr = data["actions"]
 
-    model = PPO("MlpPolicy", env, verbose=0)
-    pi = model.policy.mlp_extractor.policy_net  # get policy network
+    # prepare all training pairs
+    X = np.vstack([o for o in obs_arr])
+    Y = np.vstack([a for a in act_arr])  # shape (N, n_robots)
 
-    optimizer = model.policy.optimizer
+    X_t = torch.tensor(X, dtype=torch.float32)
+    Y_t = torch.tensor(Y, dtype=torch.long)  # indices
 
-    import torch
-    loss_fn = torch.nn.MSELoss()
+    optimizer = policy.optimizer
+    device = next(policy.parameters()).device
 
-    for epoch in range(3):
-        epoch_loss = 0
-        for obs, act in zip(obs_arr, act_arr):
-            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
-            act_t = torch.tensor(act, dtype=torch.float32)
+    N = X_t.shape[0]
+    idxs = np.arange(N)
 
-            pred = pi(obs_t)[0]
-            loss = loss_fn(pred, act_t)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
+    # policy.forward for SB3 MlpPolicy produces distribution; we will get logits from policy.net
+    for ep in range(epochs):
+        np.random.shuffle(idxs)
+        total_loss = 0.0
+        for start in range(0, N, batch_size):
+            batch_idx = idxs[start:start+batch_size]
+            batch_obs = X_t[batch_idx].to(device)
+            batch_actions = Y_t[batch_idx].to(device)  # shape (B, n_robots)
+            # forward through policy to get action logits for discrete multi-action
+            # SB3 policy has action_net producing distribution parameters; we use policy._predict() indirectly
+            # Simpler: get features from policy.mlp_extractor and then use policy.action_net
+            with torch.enable_grad():
+                features = policy.mlps_extractor(batch_obs) if hasattr(policy, "mlps_extractor") else None
+                # different SB3 versions: use policy.mlp_extractor.features if available
+                # robust approach: call policy._get_flat_acts? We'll instead call policy.forward's net
+                # Use policy._predict to obtain ndarray actions - but we need logits; instead compute MSE on continuous prox:
+                # Approach: use policy.action_net(features) if available. We'll try common SB3 attr names.
+                # Fallback: perform gradient-free imitation by minimizing difference between chosen action indices and predicted continuous output.
+                try:
+                    # For MlpPolicy, policy.action_net exists and returns logits for Discrete
+                    logits = policy.action_net(policy.mlp_extractor(batch_obs))
+                except Exception:
+                    # Fallback: run policy.forward to get distribution and compute cross-entropy using dist.log_prob
+                    dist = policy.get_distribution(batch_obs)
+                    loss = -dist.log_prob(batch_actions).mean()
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    total_loss += float(loss.detach().cpu().numpy())
+                    continue
 
-        print(f"BC Epoch {epoch+1} | Loss = {epoch_loss:.3f}")
+                # We have logits shaped (B, sum(action_dims)) or (B, n_actions) depending on implementation.
+                # For MultiDiscrete, SB3 often flattens multiple categorical heads; fallback: compute cross-entropy per robot.
+                # We'll attempt to split logits into n_robots heads by equal partition.
+                B, L = logits.shape
+                n_robots = batch_actions.shape[1]
+                head_dim = L // n_robots
+                loss = torch.tensor(0.0, device=device)
+                for r in range(n_robots):
+                    logit_r = logits[:, r*head_dim:(r+1)*head_dim]
+                    act_r = batch_actions[:, r]
+                    loss += torch.nn.functional.cross_entropy(logit_r, act_r)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total_loss += float(loss.detach().cpu().numpy())
+        print(f"BC epoch {ep+1}/{epochs} | loss={total_loss:.4f}")
 
-    print("BC Warm Start Completed.\n")
-    return model
-
-
-# ---------------------------------------------------------
-#  PHASE 3 — PPO fine-tuning
-# ---------------------------------------------------------
-def train_ppo_phase3():
-    print("\n============================")
-    print("Phase 3 PPO Training...")
-    print("============================\n")
-
-    env = MultiRobotEnergyEnvPhase3(debug=False)
-    env = Monitor(env)
-
-    demo_file = generate_expert_demos()
-
-    # Warm Start
-    bc_model = warm_start_with_bc(env, demo_file)
-
-    # PPO Fine Tuning
-    ppo_model = PPO(
-        "MlpPolicy",
-        env,
-        verbose=1,
-        learning_rate=3e-4,
-        n_steps=512,
-        batch_size=64,
-        gamma=0.99
-    )
-
-    # Load BC parameters into PPO
-    ppo_model.policy.load_state_dict(bc_model.policy.state_dict())
-
-    print(" Starting PPO Fine-Tuning...")
-    ppo_model.learn(total_timesteps=15000)
-
+def main():
     os.makedirs("models", exist_ok=True)
-    ppo_model.save("models/ppo_cooperative_phase3")
+    print("1) Generating expert demos...")
+    demo_path = generate_demos(num_episodes=250, max_steps=200, out_path="data/phase3_demos.npz")
+    print("2) Creating environment and PPO model...")
+    env = MultiRobotEnergyEnvPhase3(debug=False)
+    vec = DummyVecEnv([lambda: Monitor(env)])
+    model = PPO("MlpPolicy", vec, verbose=1)
 
-    print("\n Phase 3 Training Complete!")
-    print("Model saved → models/ppo_cooperative_phase3.zip")
+    print("3) Warm-starting policy with BC (supervised updates)...")
+    # run a few supervised updates on model.policy using demos
+    train_bc_on_policy(model.policy, demo_path, epochs=5, lr=1e-3, batch_size=128)
 
+    print("4) PPO fine-tuning...")
+    model.learn(total_timesteps=50000)
+
+    model.save("models/ppo_phase3")
+    print("Model saved to models/ppo_phase3.zip")
 
 if __name__ == "__main__":
-    train_ppo_phase3()
+    main()
