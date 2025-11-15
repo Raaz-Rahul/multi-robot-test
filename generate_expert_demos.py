@@ -15,7 +15,7 @@ def manhattan_action(x, y, dx, dy):
         return 2
     return 0
 
-def generate_demos(num_episodes=300, max_steps=200, out_path="data/phase3_demos.npz"):
+def generate_demos(num_episodes=200, max_steps=200, out_path="data/phase3_demos.npz"):
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     env = MultiRobotEnergyEnvPhase3(debug=False)
     demos = []
@@ -43,14 +43,13 @@ def generate_demos(num_episodes=300, max_steps=200, out_path="data/phase3_demos.
                                 break
                     if found:
                         continue
-                # else move towards destination
+                # else move toward destination
                 dx, dy = env.grid_size - 1, env.grid_size - 1
                 actions.append(manhattan_action(int(x), int(y), dx, dy))
             next_obs, reward, done, _, info = env.step(actions)
             demos.append((obs, np.array(actions, dtype=int), float(reward)))
             obs = next_obs
             steps += 1
-    # save safely as object arrays
     obs_list = [d[0] for d in demos]
     act_list = [d[1] for d in demos]
     rew_list = [d[2] for d in demos]
