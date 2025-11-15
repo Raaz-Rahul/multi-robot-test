@@ -2,6 +2,7 @@
 import os
 import numpy as np
 import torch
+from tqdm import tqdm
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
@@ -9,94 +10,101 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from energy_env_phase3 import MultiRobotEnergyEnvPhase3
 from generate_expert_demos import generate_demos
 
-def train_bc_on_policy(policy, demo_path, epochs=3, lr=1e-3, batch_size=64):
+def supervised_warmstart(policy, demo_path, epochs=3, batch_size=128, lr=1e-3):
     """
-    Perform supervised updates on PPO policy network using demo data.
-    policy: model.policy (a Stable-Baselines policy object)
+    Try to perform supervised imitation updates on SB3 policy.
+    Uses policy.get_distribution(obs) if available to compute log_prob of demo actions.
+    If not available, will try a logits-based approach. If it fails, raise Exception.
     """
     data = np.load(demo_path, allow_pickle=True)
     obs_arr = data["observations"]
     act_arr = data["actions"]
 
-    # prepare all training pairs
-    X = np.vstack([o for o in obs_arr])
-    Y = np.vstack([a for a in act_arr])  # shape (N, n_robots)
+    # flatten lists into arrays
+    X = np.vstack([o for o in obs_arr]).astype(np.float32)              # (N, obs_dim)
+    Y = np.vstack([a for a in act_arr]).astype(np.int64)               # (N, n_robots)
 
-    X_t = torch.tensor(X, dtype=torch.float32)
-    Y_t = torch.tensor(Y, dtype=torch.long)  # indices
-
-    optimizer = policy.optimizer
     device = next(policy.parameters()).device
+    optimizer = policy.optimizer
+    N = X.shape[0]
 
-    N = X_t.shape[0]
-    idxs = np.arange(N)
+    print("BC warm-start: datapoints =", N)
 
-    # policy.forward for SB3 MlpPolicy produces distribution; we will get logits from policy.net
     for ep in range(epochs):
-        np.random.shuffle(idxs)
+        perm = np.random.permutation(N)
         total_loss = 0.0
         for start in range(0, N, batch_size):
-            batch_idx = idxs[start:start+batch_size]
-            batch_obs = X_t[batch_idx].to(device)
-            batch_actions = Y_t[batch_idx].to(device)  # shape (B, n_robots)
-            # forward through policy to get action logits for discrete multi-action
-            # SB3 policy has action_net producing distribution parameters; we use policy._predict() indirectly
-            # Simpler: get features from policy.mlp_extractor and then use policy.action_net
-            with torch.enable_grad():
-                features = policy.mlps_extractor(batch_obs) if hasattr(policy, "mlps_extractor") else None
-                # different SB3 versions: use policy.mlp_extractor.features if available
-                # robust approach: call policy._get_flat_acts? We'll instead call policy.forward's net
-                # Use policy._predict to obtain ndarray actions - but we need logits; instead compute MSE on continuous prox:
-                # Approach: use policy.action_net(features) if available. We'll try common SB3 attr names.
-                # Fallback: perform gradient-free imitation by minimizing difference between chosen action indices and predicted continuous output.
-                try:
-                    # For MlpPolicy, policy.action_net exists and returns logits for Discrete
-                    logits = policy.action_net(policy.mlp_extractor(batch_obs))
-                except Exception:
-                    # Fallback: run policy.forward to get distribution and compute cross-entropy using dist.log_prob
-                    dist = policy.get_distribution(batch_obs)
-                    loss = -dist.log_prob(batch_actions).mean()
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    total_loss += float(loss.detach().cpu().numpy())
-                    continue
+            idx = perm[start:start+batch_size]
+            batch_obs = torch.tensor(X[idx], dtype=torch.float32, device=device)
+            batch_actions = torch.tensor(Y[idx], dtype=torch.long, device=device)  # (B, n_robots)
 
-                # We have logits shaped (B, sum(action_dims)) or (B, n_actions) depending on implementation.
-                # For MultiDiscrete, SB3 often flattens multiple categorical heads; fallback: compute cross-entropy per robot.
-                # We'll attempt to split logits into n_robots heads by equal partition.
-                B, L = logits.shape
-                n_robots = batch_actions.shape[1]
-                head_dim = L // n_robots
-                loss = torch.tensor(0.0, device=device)
-                for r in range(n_robots):
-                    logit_r = logits[:, r*head_dim:(r+1)*head_dim]
-                    act_r = batch_actions[:, r]
-                    loss += torch.nn.functional.cross_entropy(logit_r, act_r)
+            try:
+                # try distribution-based negative log-likelihood if available
+                dist = policy.get_distribution(batch_obs)
+                # for MultiDiscrete, dist.log_prob expects shape matching; if not, try sum over dims
+                logp = dist.log_prob(batch_actions)
+                loss = -logp.mean()
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 total_loss += float(loss.detach().cpu().numpy())
+            except Exception:
+                # fallback: try to get logits from action_net (works for many SB3 versions)
+                try:
+                    features = policy.mlp_excriminator(batch_obs) if hasattr(policy, "mlp_discriminator") else None
+                except Exception:
+                    features = None
+                try:
+                    # use policy.action_net and policy.mlp_extractor where available
+                    extractor = getattr(policy, "mlp_extractor", None)
+                    if extractor is not None:
+                        feats = extractor(batch_obs)
+                    else:
+                        feats = batch_obs
+                    logits = policy.action_net(feats)
+                    # split logits across robots
+                    B, L = logits.shape
+                    n_robots = batch_actions.shape[1]
+                    head = L // n_robots
+                    loss = torch.tensor(0.0, device=device)
+                    for r in range(n_robots):
+                        logit_r = logits[:, r*head:(r+1)*head]
+                        act_r = batch_actions[:, r]
+                        loss = loss + torch.nn.functional.cross_entropy(logit_r, act_r)
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    total_loss += float(loss.detach().cpu().numpy())
+                except Exception as e:
+                    # if BC fails here, propagate so caller can fall back
+                    raise RuntimeError("BC warm-start failed: " + str(e))
         print(f"BC epoch {ep+1}/{epochs} | loss={total_loss:.4f}")
 
 def main():
+    os.makedirs("data", exist_ok=True)
     os.makedirs("models", exist_ok=True)
+
     print("1) Generating expert demos...")
-    demo_path = generate_demos(num_episodes=250, max_steps=200, out_path="data/phase3_demos.npz")
+    demo_path = generate_demos(num_episodes=200, max_steps=200, out_path="data/phase3_demos.npz")
+
     print("2) Creating environment and PPO model...")
     env = MultiRobotEnergyEnvPhase3(debug=False)
-    vec = DummyVecEnv([lambda: Monitor(env)])
-    model = PPO("MlpPolicy", vec, verbose=1)
+    vec_env = DummyVecEnv([lambda: Monitor(env)])
+    model = PPO("MlpPolicy", vec_env, verbose=1)
 
-    print("3) Warm-starting policy with BC (supervised updates)...")
-    # run a few supervised updates on model.policy using demos
-    train_bc_on_policy(model.policy, demo_path, epochs=5, lr=1e-3, batch_size=128)
+    print("3) Attempting BC warm-start (best-effort)...")
+    try:
+        supervised_warmstart(model.policy, demo_path, epochs=3, batch_size=128, lr=1e-3)
+        print("BC warm-start completed.")
+    except Exception as e:
+        print("BC warm-start failed (non-fatal). Continuing with PPO training.")
+        print("BC error:", e)
 
     print("4) PPO fine-tuning...")
     model.learn(total_timesteps=50000)
 
     model.save("models/ppo_phase3")
-    print("Model saved to models/ppo_phase3.zip")
+    print("Saved PPO model to models/ppo_phase3.zip")
 
 if __name__ == "__main__":
     main()
