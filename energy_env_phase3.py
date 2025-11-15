@@ -4,14 +4,6 @@ import gymnasium as gym
 from gymnasium import spaces
 
 class MultiRobotEnergyEnvPhase3(gym.Env):
-    """
-    Phase-3 environment:
-    - n_robots robots on grid_size x grid_size
-    - observation per robot: [x, y, load(0/1), battery, Ehat]
-    - actions per robot: 0 stay,1 north,2 south,3 east,4 west,5 request transfer
-    - destination: (grid_size-1, grid_size-1)
-    - reward per step: per provided formula
-    """
     metadata = {"render_modes": []}
 
     def __init__(self, n_robots=3, grid_size=5, battery_init=50.0, debug=False):
@@ -21,25 +13,24 @@ class MultiRobotEnergyEnvPhase3(gym.Env):
         self.battery_init = float(battery_init)
         self.debug = bool(debug)
 
-        # Action space: each robot has 6 discrete actions
+        # 6 actions per robot: 0 stay,1 north,2 south,3 east,4 west,5 request transfer
         self.action_space = spaces.MultiDiscrete([6] * self.n_robots)
 
-        # Observation: x,y,load,battery,Ehat per robot
+        # Observation: [x,y,load,battery,Ehat] per robot
         high = np.array([self.grid_size, self.grid_size, 1.0, self.battery_init, self.battery_init] * self.n_robots, dtype=np.float32)
         self.observation_space = spaces.Box(low=0.0, high=high, dtype=np.float32)
 
-        # Energy parameters (as discussed)
+        # energy & reward params (as approved)
         self.a = 0.1
         self.b = 0.1
         self.lambda_viol = 10.0
         self.r_goal = 100.0
         self.coop_bonus = 20.0
 
-        # sharing params
+        # sharing / thresholds
         self.low_battery_threshold = 10.0
         self.comm_range = 2
 
-        # internal state
         self.robots = None
 
     def reset(self, seed=None, options=None):
@@ -70,10 +61,11 @@ class MultiRobotEnergyEnvPhase3(gym.Env):
 
     def step(self, actions):
         assert len(actions) == self.n_robots, f"Expected {self.n_robots} actions"
-        # record old positions to compute movement d_i
+
+        # store old positions to compute movement indicator d_i
         old_pos = [(r["x"], r["y"]) for r in self.robots]
 
-        # Apply movement (0..4). 5 is request transfer (no movement)
+        # apply movement for actions 0..4; 5=no movement (request transfer)
         for i, a in enumerate(actions):
             r = self.robots[i]
             x, y = r["x"], r["y"]
@@ -85,13 +77,13 @@ class MultiRobotEnergyEnvPhase3(gym.Env):
                 x += 1
             elif a == 4 and x > 0:
                 x -= 1
-            # else 0 stay or 5 request transfer
+            # else stay or request transfer
             r["x"], r["y"] = int(x), int(y)
 
-        # compute d_i (1 if moved, else 0)
+        # movement indicator per robot (1 if moved)
         d_list = [1 if (r["x"], r["y"]) != old_pos[i] else 0 for i, r in enumerate(self.robots)]
 
-        # energy costs and battery decrement
+        # energy cost & battery update
         energy_costs = []
         for i, r in enumerate(self.robots):
             W = r["load"]
@@ -100,25 +92,23 @@ class MultiRobotEnergyEnvPhase3(gym.Env):
             r["battery"] -= cost
             energy_costs.append(cost)
 
+        # handle transfer requests (action == 5)
         transfers = []
         coop_reward = 0.0
-
-        # Handle request transfers (action==5) first: requester asks for helper
         for i, a in enumerate(actions):
             if a == 5:
                 req = self.robots[i]
                 if req["load"] == 1:
-                    # find idle helper with battery > threshold in comm range
                     helper_idx = None
                     for j, h in enumerate(self.robots):
-                        if j == i: continue
+                        if j == i:
+                            continue
                         if h["load"] == 0 and h["battery"] > self.low_battery_threshold:
                             dist = abs(req["x"] - h["x"]) + abs(req["y"] - h["y"])
                             if dist <= self.comm_range:
                                 helper_idx = j
                                 break
                     if helper_idx is not None:
-                        # transfer
                         req["load"] = 0
                         self.robots[helper_idx]["load"] = 1
                         transfers.append((i, helper_idx))
@@ -126,7 +116,7 @@ class MultiRobotEnergyEnvPhase3(gym.Env):
                         if self.debug:
                             print(f"R{i} requested transfer → R{helper_idx} (+{self.coop_bonus})")
 
-        # Also automatic transfer: if robot low battery and idle helper nearby, transfer automatically
+        # automatic transfer if low battery and helper idle nearby
         for i in range(self.n_robots):
             ri = self.robots[i]
             if ri["load"] == 1 and ri["battery"] < self.low_battery_threshold:
@@ -155,7 +145,7 @@ class MultiRobotEnergyEnvPhase3(gym.Env):
                     if self.debug:
                         print(f"R{i} delivered parcel! +{self.r_goal}")
 
-        # violations: battery < 0 or collisions
+        # violations: battery < 0 and collisions
         violation = False
         violation_reasons = []
         for i, r in enumerate(self.robots):
@@ -176,6 +166,7 @@ class MultiRobotEnergyEnvPhase3(gym.Env):
         all_dead = all(r["battery"] <= 0.0 for r in self.robots)
         done = all_delivered or all_dead
 
+        # reward components
         r_energy = -float(sum(energy_costs))
         r_viol = -self.lambda_viol if violation else 0.0
         r_goal = float(self.r_goal) if all_delivered else 0.0
