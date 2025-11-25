@@ -186,8 +186,10 @@ class MultiRobotEnv(gym.Env):
         return obs, reward, done, truncated, info
 
     def _apply_movement(self, move):
+        old_pos = self.pos.copy()
         next_pos = self.pos.copy()
         collisions_this_step = 0
+
         for i in range(self.num_robots):
             d = MOVE_DIRS[int(move[i])]
             nx = self.pos[i, 0] + d[0]
@@ -197,6 +199,7 @@ class MultiRobotEnv(gym.Env):
             else:
                 next_pos[i] = self.pos[i]
 
+        # Collision resolution
         for i in range(self.num_robots):
             for j in range(i + 1, self.num_robots):
                 if np.array_equal(next_pos[i], next_pos[j]):
@@ -205,16 +208,17 @@ class MultiRobotEnv(gym.Env):
                     next_pos[j] = self.pos[j]
 
         self.collision_count += collisions_this_step
+
+        # Compute movement mask BEFORE updating self.pos
+        moved = np.any(next_pos != old_pos, axis=1).astype(np.float32)
+
+        # Now update positions
         self.pos = next_pos
 
-        for i in range(self.num_robots):
-            path = self.routes[i]
-            if len(path) > 0 and tuple(self.pos[i]) == path[0]:
-                self.routes[i] = path[1:]
-
-        moved = np.any(next_pos != self.pos, axis=1).astype(np.float32)
+        # Energy cost: non-zero when moved == 1
         energy = self.a * (self.load.astype(np.float32) ** 2) * moved + self.b * moved
         return energy
+
 
     def _apply_sharing(self, offload, partner, meeting, amount, masks):
         violations = 0
