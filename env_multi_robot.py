@@ -47,6 +47,8 @@ class MultiRobotEnv(gym.Env):
         self.storage_nodes = [(0, 0), (0, self.W - 1)]
         self.init_inventory = np.array([4, 4], dtype=np.int32)
 
+        self.np_random = np.random.default_rng()
+
         self.pos = None
         self.load = None
         self.battery = None
@@ -56,7 +58,6 @@ class MultiRobotEnv(gym.Env):
         self.routes = None
         self.t = 0
 
-        # Stats tracking
         self.collision_count = 0
         self.delivered_count = 0
         self.load_sharing_events = []
@@ -87,6 +88,13 @@ class MultiRobotEnv(gym.Env):
             }
         )
 
+    def _sample_non_dest(self):
+        while True:
+            x = self.np_random.integers(0, self.H)
+            y = self.np_random.integers(0, self.W)
+            if (x, y) != self.destination:
+                return np.array([x, y], dtype=np.int32)
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.t = 0
@@ -108,6 +116,20 @@ class MultiRobotEnv(gym.Env):
         obs = self._encode_obs()
         info = {"masks": self._compute_masks()}
         return obs, info
+
+    def _shortest_path_to_dest(self, start):
+        path = []
+        x, y = start
+        dx, dy = self.destination
+        while x != dx:
+            step = 1 if dx > x else -1
+            x += step
+            path.append((x, y))
+        while y != dy:
+            step = 1 if dy > y else -1
+            y += step
+            path.append((x, y))
+        return path
 
     def step(self, action):
         self.t += 1
