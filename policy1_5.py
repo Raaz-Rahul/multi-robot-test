@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class CentralizedPolicy(nn.Module):
     def __init__(
         self,
@@ -42,10 +41,8 @@ class CentralizedPolicy(nn.Module):
     def forward(self, obs, masks=None):
         x = self.trunk(obs)
         B = x.size(0)
-
         def reshape(head, dim):
             return head.view(B, self.num_robots, dim)
-
         move_logits = reshape(self.move_head(x), self.num_move)
         offload_logits = reshape(self.offload_head(x), self.num_offload)
         partner_logits = reshape(self.partner_head(x), self.num_partner)
@@ -64,7 +61,6 @@ class CentralizedPolicy(nn.Module):
                 amount_logits = amount_logits + (1.0 - masks["amount"]) * big_neg
 
         value = self.value_head(x).squeeze(-1)
-
         return {
             "move_logits": move_logits,
             "offload_logits": offload_logits,
@@ -83,10 +79,6 @@ class CentralizedPolicy(nn.Module):
         return a, logp, ent
 
     def sample_action(self, obs, masks=None):
-        """
-        obs: [1, obs_dim]
-        Returns: action dict with per-robot arrays and log_prob, value.
-        """
         out = self.forward(obs, masks)
         move_logits = out["move_logits"]
         offload_logits = out["offload_logits"]
@@ -101,37 +93,19 @@ class CentralizedPolicy(nn.Module):
         meeting, lp_M, ent_M = self._sample_head(meeting_logits)
         amount, lp_w, ent_w = self._sample_head(amount_logits)
 
-        logp = (
-            lp_m.sum(dim=1)
-            + lp_o.sum(dim=1)
-            + lp_p.sum(dim=1)
-            + lp_M.sum(dim=1)
-            + lp_w.sum(dim=1)
-        )
-        entropy = (
-            ent_m.sum(dim=1)
-            + ent_o.sum(dim=1)
-            + ent_p.sum(dim=1)
-            + ent_M.sum(dim=1)
-            + ent_w.sum(dim=1)
-        )
+        logp = lp_m.sum(dim=1) + lp_o.sum(dim=1) + lp_p.sum(dim=1) + lp_M.sum(dim=1) + lp_w.sum(dim=1)
+        entropy = ent_m.sum(dim=1) + ent_o.sum(dim=1) + ent_p.sum(dim=1) + ent_M.sum(dim=1) + ent_w.sum(dim=1)
 
         action = {
-            "move": move.squeeze(0).cpu().numpy(),
-            "offload": offload.squeeze(0).cpu().numpy(),
-            "partner": partner.squeeze(0).cpu().numpy(),
-            "meeting": meeting.squeeze(0).cpu().numpy(),
-            "amount": amount.squeeze(0).cpu().numpy(),
+            "move": move.squeeze(0),
+            "offload": offload.squeeze(0),
+            "partner": partner.squeeze(0),
+            "meeting": meeting.squeeze(0),
+            "amount": amount.squeeze(0),
         }
         return action, logp.squeeze(0), entropy.squeeze(0), value.squeeze(0)
 
     def evaluate_actions(self, obs, action, masks=None):
-        """
-        For PPO: compute log_prob and entropy for given actions.
-
-        obs: [B, obs_dim]
-        action: dict of tensors with shape [B, n]
-        """
         out = self.forward(obs, masks)
         move_logits = out["move_logits"]
         offload_logits = out["offload_logits"]
