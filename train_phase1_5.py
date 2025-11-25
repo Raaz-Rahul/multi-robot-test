@@ -171,44 +171,47 @@ def main():
         indices = np.arange(n_samples)
 
         for _ in range(ppo_epochs):
-            np.random.shuffle(indices)
-            for start in range(0, n_samples, mini_batch_size):
-                end = start + mini_batch_size
-                mb_idx = indices[start:end]
+    np.random.shuffle(indices)
+    for start in range(0, n_samples, mini_batch_size):
+        end = start + mini_batch_size
+        mb_idx = indices[start:end]
 
-                mb_obs = obs_batch[mb_idx]
-                mb_adv = adv_batch[mb_idx]
-                mb_ret = ret_batch[mb_idx]
-                mb_logp_old = logp_old_batch[mb_idx]
+        mb_obs = obs_batch[mb_idx]
+        mb_adv = adv_batch[mb_idx]
+        mb_ret = ret_batch[mb_idx]
+        mb_logp_old = logp_old_batch[mb_idx]
 
-                mb_action = {k: v[mb_idx] for k, v in act_batch.items()}
-                mb_masks = {
-                    "movement": mask_batch["movement"][mb_idx],
-                    "partner": mask_batch["partner"][mb_idx],
-                    "meeting": mask_batch["meeting"][mb_idx],
-                    "amount": mask_batch["amount"][mb_idx],
-                }
+        mb_action = {k: v[mb_idx] for k, v in act_batch.items()}
+        mb_masks = {
+            "movement": mask_batch["movement"][mb_idx],
+            "partner": mask_batch["partner"][mb_idx],
+            "meeting": mask_batch["meeting"][mb_idx],
+            "amount": mask_batch["amount"][mb_idx],
+        }
 
-                logp, entropy, value = policy.evaluate_actions(mb_obs, mb_action, masks=mb_masks)
-                logp = logp.sum(dim=0) if logp.dim() > 1 else logp  # sum robot dimension if present
-                entropy = entropy.sum(dim=0) if entropy.dim() > 1 else entropy
+        # Evaluate actions and get log_prob, entropy, value with shape [batch_size]
+        logp, entropy, value = policy.evaluate_actions(mb_obs, mb_action, masks=mb_masks)
 
+        # Compute PPO ratio with compatible shapes
+        ratio = torch.exp(logp - mb_logp_old)
 
-                ratio = torch.exp(logp - mb_logp_old)
-                surr1 = ratio * mb_adv
-                surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv
-                policy_loss = -torch.min(surr1, surr2).mean()
+        surr1 = ratio * mb_adv
+        surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv
+        policy_loss = -torch.min(surr1, surr2).mean()
 
-                value_loss = F.mse_loss(value, mb_ret)
-                entropy_loss = -entropy.mean()
-                kl_est = torch.mean((mb_logp_old - logp) ** 2)
+        value_loss = F.mse_loss(value, mb_ret)
+        entropy_loss = -entropy.mean()
 
-                loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss + kl_coef * kl_est
+        # KL divergence surrogate (optional)
+        kl_est = torch.mean((mb_logp_old - logp) ** 2)
 
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
-                optimizer.step()
+        loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss + kl_coef * kl_est
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
+        optimizer.step()
+
 
         print(f"step={global_step} phase={current_phase} avgR={np.mean(episode_rewards[-10:]):.2f}")
 
