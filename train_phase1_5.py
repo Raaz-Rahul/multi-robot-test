@@ -189,12 +189,15 @@ def main():
                 "amount": mask_batch["amount"][mb_idx],
                 }
 
-                # Evaluate actions and get log_prob, entropy, value with shape [batch_size]
                 logp, entropy, value = policy.evaluate_actions(mb_obs, mb_action, masks=mb_masks)
 
-                # Compute PPO ratio with compatible shapes
-                ratio = torch.exp(logp - mb_logp_old)
+                # Sum over robots (dimension 1) if output is 2D
+                if logp.dim() == 2:
+                    logp = logp.sum(dim=1)
+                if entropy.dim() == 2:
+                    entropy = entropy.sum(dim=1)
 
+                ratio = torch.exp(logp - mb_logp_old)
                 surr1 = ratio * mb_adv
                 surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv
                 policy_loss = -torch.min(surr1, surr2).mean()
@@ -202,7 +205,6 @@ def main():
                 value_loss = F.mse_loss(value, mb_ret)
                 entropy_loss = -entropy.mean()
 
-                # KL divergence surrogate (optional)
                 kl_est = torch.mean((mb_logp_old - logp) ** 2)
 
                 loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss + kl_coef * kl_est
@@ -211,6 +213,7 @@ def main():
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
                 optimizer.step()
+
 
 
         print(f"step={global_step} phase={current_phase} avgR={np.mean(episode_rewards[-10:]):.2f}")
