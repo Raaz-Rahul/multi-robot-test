@@ -1,13 +1,11 @@
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
+import torch.optim as optim
+import matplotlib.pyplot as plt
 
 from env_multi_robot import MultiRobotEnv
 from policy1_5 import CentralizedPolicy
-
-
 
 def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
     T = len(rewards)
@@ -22,20 +20,16 @@ def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
     returns = adv + values[:T]
     return adv, returns
 
-
 def to_tensor_action(batch_actions, device):
-    # Convert list of dicts into dict of tensors [B, n]
     keys = ["move", "offload", "partner", "meeting", "amount"]
     out = {}
     B = len(batch_actions)
     for k in keys:
-        arr = np.stack([a[k] for a in batch_actions], axis=0)
+        arr = np.stack([a[k].cpu().numpy() if torch.is_tensor(a[k]) else a[k] for a in batch_actions], axis=0)
         out[k] = torch.from_numpy(arr).long().to(device)
     return out
 
-
 def make_mask_batch(mask_list, env, device):
-    # Each entry in mask_list is env._compute_masks() output.
     B = len(mask_list)
     n = env.num_robots
     movement = np.stack([m["movement"] for m in mask_list], axis=0)
@@ -49,16 +43,9 @@ def make_mask_batch(mask_list, env, device):
         "amount": torch.from_numpy(amount).float().to(device),
     }
 
-
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    env = MultiRobotEnv(
-        grid_size=(10, 10),
-        num_robots=3,
-        phase=1,
-        max_steps=200,
-    )
+    env = MultiRobotEnv(grid_size=(10, 10), num_robots=3, phase=1, max_steps=200)
 
     obs_dim = env.obs_dim
     policy = CentralizedPolicy(
@@ -74,7 +61,6 @@ def main():
 
     optimizer = optim.Adam(policy.parameters(), lr=3e-4)
 
-    # Hyperparameters from Table 1 (approx). [attached_file:1]
     total_steps = 200_000
     rollout_len = 2048
     ppo_epochs = 4
@@ -86,18 +72,10 @@ def main():
     gamma = 0.99
     lam = 0.95
 
-    # Curriculum (Section 6): steps at which phase increments. [attached_file:1]
-    boundaries = {
-        1: 0,
-        2: 40_000,
-        3: 70_000,
-        4: 100_000,
-        5: 130_000,
-    }
-
+    boundaries = {1:0, 2:40000, 3:70000, 4:100000, 5:130000}
     def update_phase(global_step):
         phase = 1
-        for p, s in sorted(boundaries.items(), key=lambda x: x[1]):
+        for p, s in sorted(boundaries.items(), key=lambda x:x[1]):
             if global_step >= s:
                 phase = p
         env.phase = phase
@@ -107,16 +85,16 @@ def main():
     obs, info = env.reset()
     obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)
 
+    episode_rewards = []
+    episode_collision_counts = []
+    episode_deliveries = []
+    episode_load_sharing = []
+    episode_battery_levels = [[] for _ in range(env.num_robots)]
+    episode_loads = [[] for _ in range(env.num_robots)]
+
     while global_step < total_steps:
         current_phase = update_phase(global_step)
-
-        obs_buf = []
-        act_buf = []
-        rew_buf = []
-        done_buf = []
-        val_buf = []
-        logp_buf = []
-        mask_buf = []
+        obs_buf, act_buf, rew_buf, done_buf, val_buf, logp_buf, mask_buf = [], [], [], [], [], [], []
 
         for _ in range(rollout_len):
             masks_np = info["masks"]
@@ -145,13 +123,27 @@ def main():
             obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)
 
             if done or truncated:
+                env.render()  # Added render call to see state textually
+                episode_rewards.append(np.sum(rew_buf))
+                episode_collision_counts.append(env.collision_count)
+                episode_deliveries.append(env.delivered_count)
+                episode_load_sharing.append(env.load_sharing_events.copy())
+                for i in range(env.num_robots):
+                    episode_battery_levels[i].append(env.battery_history[i][:])
+                    episode_loads[i].append(env.load_history[i][:])
+
+                env.collision_count = 0
+                env.delivered_count = 0
+                env.load_sharing_events.clear()
+                env.battery_history = [[] for _ in range(env.num_robots)]
+                env.load_history = [[] for _ in range(env.num_robots)]
+
                 obs, info = env.reset()
                 obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)
 
             if global_step >= total_steps:
                 break
 
-        # GAE
         rewards = np.array(rew_buf, dtype=np.float32)
         dones = np.array(done_buf, dtype=np.bool_)
         values = np.array(val_buf + [0.0], dtype=np.float32)
@@ -174,11 +166,11 @@ def main():
             for start in range(0, n_samples, mini_batch_size):
                 end = start + mini_batch_size
                 mb_idx = indices[start:end]
+
                 mb_obs = obs_batch[mb_idx]
                 mb_adv = adv_batch[mb_idx]
                 mb_ret = ret_batch[mb_idx]
                 mb_logp_old = logp_old_batch[mb_idx]
-
                 mb_action = {k: v[mb_idx] for k, v in act_batch.items()}
                 mb_masks = {
                     "movement": mask_batch["movement"][mb_idx],
@@ -196,26 +188,58 @@ def main():
 
                 value_loss = F.mse_loss(value, mb_ret)
                 entropy_loss = -entropy.mean()
-                kl_est = torch.mean((mb_logp_old - logp) ** 2)  # simple surrogate
+                kl_est = torch.mean((mb_logp_old - logp) ** 2)
 
-                loss = (
-                    policy_loss
-                    + vf_coef * value_loss
-                    + ent_coef * entropy_loss
-                    + kl_coef * kl_est
-                )
+                loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss + kl_coef * kl_est
 
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
                 optimizer.step()
 
-        print(
-            f"step={global_step} phase={current_phase} "
-            f"avgR={rewards.mean():.2f} "
-            f"advMean={adv.mean():.2f}"
-        )
+        print(f"step={global_step} phase={current_phase} avgR={np.mean(episode_rewards[-10:]):.2f}")
 
+    # Plot after training
+    plt.figure()
+    plt.plot(episode_rewards)
+    plt.title("Episode Rewards")
+    plt.xlabel("Episode")
+    plt.ylabel("Total Reward")
+    plt.show()
+
+    plt.figure()
+    plt.plot(episode_collision_counts)
+    plt.title("Collisions per Episode")
+    plt.xlabel("Episode")
+    plt.ylabel("Collision Count")
+    plt.show()
+
+    plt.figure()
+    for i in range(env.num_robots):
+        if episode_battery_levels[i]:
+            plt.plot(episode_battery_levels[i][-1], label=f"Robot {i}")
+    plt.title("Battery Levels Last Episode")
+    plt.xlabel("Step")
+    plt.ylabel("Battery")
+    plt.legend()
+    plt.show()
+
+    plt.figure()
+    for i in range(env.num_robots):
+        if episode_loads[i]:
+            plt.plot(episode_loads[i][-1], label=f"Robot {i}")
+    plt.title("Loads Last Episode")
+    plt.xlabel("Step")
+    plt.ylabel("Load")
+    plt.legend()
+    plt.show()
+
+    total_sharing = sum(len(ev) for ev in episode_load_sharing)
+    print(f"Total load sharing events during training: {total_sharing}")
+    if episode_load_sharing:
+        print("Last episode sharing events:")
+        for t, f, to, w in episode_load_sharing[-1]:
+            print(f"Time {t}: Robot {f} shared {w} items with Robot {to}")
 
 if __name__ == "__main__":
     main()
