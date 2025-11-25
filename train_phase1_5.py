@@ -72,6 +72,7 @@ def main():
     gamma = 0.99
     lam = 0.95
 
+    # Curriculum phase boundaries
     boundaries = {1:0, 2:40000, 3:70000, 4:100000, 5:130000}
     def update_phase(global_step):
         phase = 1
@@ -123,7 +124,8 @@ def main():
             obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)
 
             if done or truncated:
-                env.render()  # Added render call to see state textually
+                env.render()  # Display textual robot grid state
+
                 episode_rewards.append(np.sum(rew_buf))
                 episode_collision_counts.append(env.collision_count)
                 episode_deliveries.append(env.delivered_count)
@@ -171,6 +173,7 @@ def main():
                 mb_adv = adv_batch[mb_idx]
                 mb_ret = ret_batch[mb_idx]
                 mb_logp_old = logp_old_batch[mb_idx]
+
                 mb_action = {k: v[mb_idx] for k, v in act_batch.items()}
                 mb_masks = {
                     "movement": mask_batch["movement"][mb_idx],
@@ -199,7 +202,7 @@ def main():
 
         print(f"step={global_step} phase={current_phase} avgR={np.mean(episode_rewards[-10:]):.2f}")
 
-    # Plot after training
+    # Plotting results after training finishes
     plt.figure()
     plt.plot(episode_rewards)
     plt.title("Episode Rewards")
