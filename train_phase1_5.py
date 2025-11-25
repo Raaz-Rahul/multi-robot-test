@@ -190,6 +190,9 @@ def main():
                 }
 
                 logp, entropy, value = policy.evaluate_actions(mb_obs, mb_action, masks=mb_masks)
+                logp = logp.sum(dim=0) if logp.dim() > 1 else logp  # sum robot dimension if present
+                entropy = entropy.sum(dim=0) if entropy.dim() > 1 else entropy
+
 
                 ratio = torch.exp(logp - mb_logp_old)
                 surr1 = ratio * mb_adv
