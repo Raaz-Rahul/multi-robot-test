@@ -117,14 +117,21 @@ def main():
             rew_buf.append(reward)
             done_buf.append(done or truncated)
             val_buf.append(value.item())
-            logp_buf.append(logp.item())
+
+            # Fix here: Store scalar summed logp for PPO update consistency
+            if logp.dim() > 0:
+                logp_scalar = logp.sum().item()
+            else:
+                logp_scalar = logp.item()
+            logp_buf.append(logp_scalar)
+
             mask_buf.append(masks_np)
 
             obs = next_obs
             obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)
 
             if done or truncated:
-                env.render()  # Display textual robot grid state
+                env.render()
 
                 episode_rewards.append(np.sum(rew_buf))
                 episode_collision_counts.append(env.collision_count)
@@ -202,7 +209,7 @@ def main():
 
         print(f"step={global_step} phase={current_phase} avgR={np.mean(episode_rewards[-10:]):.2f}")
 
-    # Plotting results after training finishes
+    # Plot after training ends
     plt.figure()
     plt.plot(episode_rewards)
     plt.title("Episode Rewards")
