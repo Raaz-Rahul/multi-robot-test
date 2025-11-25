@@ -1,385 +1,378 @@
-# env.py
-# Multi-robot load-sharing environment (Phases 0–5)
-# Destination is sampled uniformly at reset.
-# Reference spec (local): /mnt/data/RL Energy Shared Multi-Robot.pdf
-
 import numpy as np
-from typing import Dict, Tuple, Optional, Any
+import gymnasium as gym
+from gymnasium import spaces
 
-REFERENCE_PDF = "/mnt/data/RL Energy Shared Multi-Robot.pdf"
+MOVE_DIRS = {
+    0: (-1, 0),  # N
+    1: (1, 0),   # S
+    2: (0, 1),   # E
+    3: (0, -1),  # W
+    4: (0, 0),   # Stay
+}
 
-class MultiRobotEnv:
-    """
-    Centralized multi-robot delivery environment.
-    Per-robot action block: [move, offload, partner, meeting_idx, w_idx]
-    move: 0 stay, 1 up, 2 down, 3 left, 4 right
-    """
+class MultiRobotEnv(gym.Env):
+    metadata = {"render_modes": ["human"], "render_fps": 4}
 
-    def __init__(self,
-                 grid_size: Tuple[int,int] = (10, 10),
-                 n_robots: int = 3,
-                 storage_nodes: Optional[Dict[Tuple[int,int],int]] = None,
-                 dest: Optional[Tuple[int,int]] = None,
-                 init_battery: float = 100.0,
-                 a: float = 1.0,
-                 b: float = 0.1,
-                 share_radius: int = 5,
-                 beta: float = 0.8,
-                 max_load_per_robot: int = 20,
-                 max_steps: int = 500,
-                 seed: Optional[int] = 0):
-        self.grid_size = grid_size
-        self.n = n_robots
-        self.init_battery = init_battery
-        self.a = a
-        self.b = b
-        self.r = share_radius
-        self.beta = beta
-        self.max_load = max_load_per_robot
+    def __init__(
+        self,
+        grid_size=(10, 10),
+        num_robots=3,
+        phase=1,
+        max_steps=200,
+        a_energy=1.0,
+        b_energy=0.1,
+        battery_budget=200.0,
+        max_load=6,
+        share_radius=5,
+        beta_threshold=0.8,
+        violation_penalty=10.0,
+        goal_reward=100.0,
+    ):
+        super().__init__()
+        self.H, self.W = grid_size
+        self.num_robots = num_robots
+        self.phase = phase
         self.max_steps = max_steps
 
-        # storage nodes
-        if storage_nodes is None:
-            mid = (grid_size[0]//2, grid_size[1]//2)
-            storage_nodes = {mid: 10}
-        self.storage_nodes = dict(storage_nodes)
+        self.a = a_energy
+        self.b = b_energy
+        self.battery_budget = battery_budget
+        self.max_load = max_load
+        self.share_radius = share_radius
+        self.beta = beta_threshold
+        self.violation_penalty = violation_penalty
+        self.goal_reward = goal_reward
 
-        # action and state sizes
-        self.move_actions = 5
-        self.w_bins = list(range(0, 11))
-        self.per_robot_dims = [
-            self.move_actions,
-            2,
-            self.n,
-            grid_size[0] * grid_size[1],
-            len(self.w_bins)
-        ]
+        self.destination = (self.H - 1, self.W - 1)
+        self.storage_nodes = [(0, 0), (0, self.W - 1)]
+        self.init_inventory = np.array([4, 4], dtype=np.int32)
 
-        # RNG and initial dest (may be overwritten in reset)
-        self.rng = np.random.default_rng(seed)
-        self._initial_dest = dest
-        self.reset(seed)
+        self.np_random = np.random.default_rng()
 
-    # -------------------------
-    # Reset / Observations
-    # -------------------------
-    def reset(self, seed: Optional[int] = None) -> Dict[str, Any]:
-        """
-        Reset environment. Destination is sampled uniformly anywhere on the grid,
-        avoiding storage nodes and initial robot starting cells.
-        """
-        if seed is not None:
-            self.rng = np.random.default_rng(seed)
+        self.pos = None
+        self.load = None
+        self.battery = None
+        self.inventory = None
+        self.forecast = None
+        self.offload_indicator = None
+        self.routes = None
+        self.t = 0
 
-        # initial robot positions on row 0, columns 0..n-1 (clipped)
-        self.positions = {i: (0, min(i, self.grid_size[1] - 1)) for i in range(self.n)}
-        self.loads = {i: 0 for i in range(self.n)}
-        self.batteries = {i: self.init_battery for i in range(self.n)}
-        self.inventory = dict(self.storage_nodes)
-        self.time_step = 0
-        self.done = False
-        self.stuck_counters = {i: 0 for i in range(self.n)}
+        self.collision_count = 0
+        self.delivered_count = 0
+        self.load_sharing_events = []
+        self.battery_history = [[] for _ in range(self.num_robots)]
+        self.load_history = [[] for _ in range(self.num_robots)]
 
-        # precompute nodes and radius-balls
-        self._precompute()
+        robot_dim = 6
+        global_dim = len(self.storage_nodes) + 2
+        self.obs_dim = num_robots * robot_dim + global_dim
 
-        # sample destination uniformly (Option A). If an initial dest provided on init, still randomize on reset.
-        self._sample_random_dest()
+        self.observation_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(self.obs_dim,), dtype=np.float32
+        )
 
-        # energy forecasts
-        self.E_hat = {i: self._compute_energy_forecast(i) for i in range(self.n)}
-        return self._get_obs()
+        self.num_move = 5
+        self.num_offload = 2
+        self.num_partner = self.num_robots
+        self.num_meeting = self.H * self.W
+        self.num_amount = self.max_load + 1
 
-    def _precompute(self):
-        self.node_list = [(i, j) for i in range(self.grid_size[0]) for j in range(self.grid_size[1])]
-        self.node_to_idx = {n: i for i, n in enumerate(self.node_list)}
-        self.idx_to_node = {i: n for n, i in self.node_to_idx.items()}
-        self.r_balls = {}
-        for x in range(self.grid_size[0]):
-            for y in range(self.grid_size[1]):
-                self.r_balls[(x, y)] = [
-                    (i, j)
-                    for i in range(self.grid_size[0]) for j in range(self.grid_size[1])
-                    if abs(x - i) + abs(y - j) <= self.r
-                ]
+        self.action_space = spaces.Dict(
+            {
+                "move": spaces.MultiDiscrete([self.num_move] * self.num_robots),
+                "offload": spaces.MultiDiscrete([self.num_offload] * self.num_robots),
+                "partner": spaces.MultiDiscrete([self.num_partner] * self.num_robots),
+                "meeting": spaces.MultiDiscrete([self.num_meeting] * self.num_robots),
+                "amount": spaces.MultiDiscrete([self.num_amount] * self.num_robots),
+            }
+        )
 
-    def _sample_random_dest(self):
-        # valid cells exclude storage nodes and robot start positions
-        forbidden = set(self.storage_nodes.keys()) | set(self.positions.values())
-        candidates = [cell for cell in self.node_list if cell not in forbidden]
-        if not candidates:
-            # fallback: allow any cell
-            candidates = list(self.node_list)
-        self.dest = tuple(self.rng.choice(len(candidates)))
-        # rng.choice returned index; convert:
-        self.dest = candidates[self.dest]
+    def _sample_non_dest(self):
+        while True:
+            x = self.np_random.integers(0, self.H)
+            y = self.np_random.integers(0, self.W)
+            if (x, y) != self.destination:
+                return np.array([x, y], dtype=np.int32)
 
-    def _get_obs(self) -> Dict[str, Any]:
-        per_robot = []
-        for i in range(self.n):
-            x, y = self.positions[i]
-            load = self.loads[i]
-            bat_ratio = float(self.batteries[i] / self.init_battery)
-            Ehat = float(self.E_hat.get(i, 0.0))
-            offload_hint = 1.0 if Ehat > self.beta * self.batteries[i] else 0.0
-            per_robot.extend([
-                x / self.grid_size[0],
-                y / self.grid_size[1],
-                load / self.max_load,
-                bat_ratio,
-                Ehat / (self.init_battery + 1e-8),
-                offload_hint
-            ])
-        inv_vec = [self.inventory.get(n, 0) / 100.0 for n in self.node_list if n in self.storage_nodes]
-        dest_vec = [self.dest[0] / self.grid_size[0], self.dest[1] / self.grid_size[1]]
-        flat = np.array(per_robot + inv_vec + dest_vec, dtype=np.float32)
-        return {"state": flat, "masks": self._compute_masks()}
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.t = 0
+        self.pos = np.zeros((self.num_robots, 2), dtype=np.int32)
+        for i in range(self.num_robots):
+            self.pos[i] = self._sample_non_dest()
+        self.load = np.zeros(self.num_robots, dtype=np.int32)
+        self.battery = np.full(self.num_robots, self.battery_budget, dtype=np.float32)
+        self.inventory = self.init_inventory.copy()
+        self.routes = [self._shortest_path_to_dest(tuple(self.pos[i])) for i in range(self.num_robots)]
 
-    # -------------------------
-    # Masks
-    # -------------------------
-    def _compute_masks(self) -> Dict[int, Dict[str, np.ndarray]]:
-        masks = {i: {} for i in range(self.n)}
-        for i in range(self.n):
-            x, y = self.positions[i]
-            move_mask = np.ones(self.move_actions, dtype=bool)
-            if x == 0: move_mask[1] = False
-            if x == self.grid_size[0] - 1: move_mask[2] = False
-            if y == 0: move_mask[3] = False
-            if y == self.grid_size[1] - 1: move_mask[4] = False
-            if self.batteries[i] <= 0:
-                move_mask[:] = False
-                move_mask[0] = True
-            masks[i]['move_mask'] = move_mask
+        self.collision_count = 0
+        self.delivered_count = 0
+        self.load_sharing_events.clear()
+        self.battery_history = [[] for _ in range(self.num_robots)]
+        self.load_history = [[] for _ in range(self.num_robots)]
 
-        for i in range(self.n):
-            if self.batteries[i] <= 0:
-                masks[i]['partner_mask'] = np.zeros(self.n, dtype=bool)
-                masks[i]['meeting_mask'] = np.zeros(len(self.node_list), dtype=bool)
-                masks[i]['offload_mask'] = np.array([1, 0], dtype=bool)
-                masks[i]['w_mask'] = np.zeros(len(self.w_bins), dtype=bool)
-                continue
-            partner_mask = np.zeros(self.n, dtype=bool)
-            meeting_mask = np.zeros(len(self.node_list), dtype=bool)
-            xi, yi = self.positions[i]
-            for j in range(self.n):
-                if i == j: continue
-                if self.batteries[j] <= 0: continue
-                xj, yj = self.positions[j]
-                if abs(xi - xj) + abs(yi - yj) <= 2 * self.r:
-                    partner_mask[j] = True
-            for idx, node in enumerate(self.node_list):
-                if node in self.r_balls[self.positions[i]]:
-                    meeting_mask[idx] = True
-            masks[i]['partner_mask'] = partner_mask
-            masks[i]['meeting_mask'] = meeting_mask
-            masks[i]['offload_mask'] = np.array([1, 1], dtype=bool)
-            masks[i]['w_mask'] = np.array([1 if w <= self.loads[i] else 0 for w in self.w_bins], dtype=bool)
-        return masks
+        self._update_forecasts_and_flags()
+        obs = self._encode_obs()
+        info = {"masks": self._compute_masks()}
+        return obs, info
 
-    # -------------------------
-    # Movement helpers
-    # -------------------------
-    def _apply_move(self, pos: Tuple[int,int], move: int, robot_idx: Optional[int] = None) -> Tuple[int,int]:
-        if robot_idx is not None and self.batteries.get(robot_idx, 1) <= 0:
-            return pos
-        x, y = pos
-        if move == 0: return (x, y)
-        if move == 1 and x > 0: return (x - 1, y)
-        if move == 2 and x < self.grid_size[0] - 1: return (x + 1, y)
-        if move == 3 and y > 0: return (x, y - 1)
-        if move == 4 and y < self.grid_size[1] - 1: return (x, y + 1)
-        return (x, y)
+    def _shortest_path_to_dest(self, start):
+        path = []
+        x, y = start
+        dx, dy = self.destination
+        while x != dx:
+            step = 1 if dx > x else -1
+            x += step
+            path.append((x, y))
+        while y != dy:
+            step = 1 if dy > y else -1
+            y += step
+            path.append((x, y))
+        return path
 
-    def _compute_energy_forecast(self, robot_idx: int, pos_override: Optional[Tuple[int,int]] = None) -> float:
-        pos = pos_override if pos_override is not None else self.positions[robot_idx]
-        path_len = abs(pos[0] - self.dest[0]) + abs(pos[1] - self.dest[1])
-        W = self.loads[robot_idx]
-        return float(path_len * (self.a * (W ** 2) + self.b))
-
-    def _step_towards(self, pos: Tuple[int,int], target: Tuple[int,int]) -> Tuple[int,int]:
-        x, y = pos; tx, ty = target
-        if x < tx: return (x + 1, y)
-        if x > tx: return (x - 1, y)
-        if y < ty: return (x, y + 1)
-        if y > ty: return (x, y - 1)
-        return (x, y)
-
-    # -------------------------
-    # Step: core logic + detailed info
-    # -------------------------
-    def step(self, action: np.ndarray) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
-        info: Dict[str, Any] = {}
-        violations = {i: [] for i in range(self.n)}
-        delivered = {i: False for i in range(self.n)}
-        info['action_vector'] = action.copy() if isinstance(action, np.ndarray) else np.array(action)
-
-        if self.done:
-            obs = self._get_obs()
-            info['state_vector'] = obs['state'].copy()
-            info['violations'] = violations
-            info['delivered'] = delivered
-            info['energy'] = 0.0
-            return obs, 0.0, True, info
-
-        if action.shape[0] != self.n * len(self.per_robot_dims):
-            raise ValueError("action length mismatch")
-
-        parsed = {}
-        for i in range(self.n):
-            base = i * len(self.per_robot_dims)
-            mv = int(action[base + 0])
-            off = int(action[base + 1])
-            partner = int(action[base + 2])
-            meeting_idx = int(action[base + 3])
-            w_idx = int(action[base + 4])
-            parsed[i] = {"move": mv, "offload": off, "partner": partner, "meeting_idx": meeting_idx, "w_idx": w_idx}
+    def step(self, action):
+        self.t += 1
+        move = np.array(action["move"], dtype=np.int64)
+        offload = np.array(action["offload"], dtype=np.int64)
+        partner = np.array(action["partner"], dtype=np.int64)
+        meeting = np.array(action["meeting"], dtype=np.int64)
+        amount = np.array(action["amount"], dtype=np.int64)
 
         masks = self._compute_masks()
 
-        # enforce masks; record violations
-        for i in range(self.n):
-            if not masks[i]['move_mask'][parsed[i]['move']]:
-                violations[i].append("illegal_move_attempt")
-                parsed[i]['move'] = 0
-            if not masks[i]['offload_mask'][parsed[i]['offload']]:
-                violations[i].append("illegal_offload_attempt")
-                parsed[i]['offload'] = 0
-            if parsed[i]['partner'] < 0 or parsed[i]['partner'] >= self.n:
-                violations[i].append("invalid_partner_index")
-                parsed[i]['partner'] = 0
-            if parsed[i]['meeting_idx'] < 0 or parsed[i]['meeting_idx'] >= len(self.node_list):
-                violations[i].append("invalid_meeting_index")
-                parsed[i]['meeting_idx'] = self.node_to_idx[self.positions[i]]
-            if parsed[i]['w_idx'] < 0 or parsed[i]['w_idx'] >= len(self.w_bins):
-                violations[i].append("invalid_w_idx")
-                parsed[i]['w_idx'] = 0
+        violations = 0
+        if self.phase >= 5:
+            violations += self._count_violations(move, offload, partner, meeting, amount, masks)
 
-        # 1) apply moves
-        prev_positions = dict(self.positions)
-        for i in range(self.n):
-            self.positions[i] = self._apply_move(self.positions[i], parsed[i]['move'], robot_idx=i)
+        energy_step = self._apply_movement(move)
+        self._auto_pick_drop()
 
-        # collisions -> revert and mark violation
-        pos_counts = {}
-        for i in range(self.n):
-            pos_counts.setdefault(self.positions[i], []).append(i)
-        collisions = []
-        for pos, who in pos_counts.items():
-            if len(who) > 1:
-                collisions.extend(who)
-                for idx in who:
-                    self.positions[idx] = prev_positions[idx]
-                    violations[idx].append("collision")
+        if self.phase >= 4:
+            violations += self._apply_sharing(offload, partner, meeting, amount, masks)
 
-        # 2) pickup / delivery
-        for i in range(self.n):
-            pos = self.positions[i]
-            if pos in self.inventory and self.inventory[pos] > 0 and self.loads[i] < self.max_load and self.batteries[i] > 0:
-                pickup = min(1, self.inventory[pos], self.max_load - self.loads[i])
-                self.inventory[pos] -= pickup
-                self.loads[i] += pickup
-            if pos == self.dest and self.loads[i] > 0:
-                self.loads[i] = 0
-                delivered[i] = True
+        self.battery -= energy_step
+        base_cost = np.sum(energy_step)
+        reward = -float(base_cost)
+        if violations > 0:
+            reward -= self.violation_penalty * violations
 
-    # -------------------------
-    # (continued) sharing, energy, penalties, return
-    # -------------------------
-        # 3) collect sharing proposals
-        proposals = []
-        for i in range(self.n):
-            if parsed[i]['offload'] == 1 and self.batteries[i] > 0:
-                j = parsed[i]['partner']
-                if j == i:
-                    violations[i].append("offload_to_self")
-                    continue
-                if self.batteries.get(j, -1) <= 0:
-                    violations[i].append("partner_no_battery")
-                    continue
-                if abs(self.positions[i][0] - self.positions[j][0]) + abs(self.positions[i][1] - self.positions[j][1]) > 2 * self.r:
-                    violations[i].append("partner_out_of_range")
-                    continue
-                meeting_node = self.idx_to_node.get(parsed[i]['meeting_idx'], self.positions[i])
-                if meeting_node not in self.r_balls[self.positions[i]] or meeting_node not in self.r_balls[self.positions[j]]:
-                    violations[i].append("meeting_node_infeasible")
-                    continue
-                Wi = self.loads[i]; Wj = self.loads[j]
-                w = (Wi - Wj) // 2
-                if w <= 0:
-                    violations[i].append("no_need_to_share")
-                    continue
-                w = min(w, self.max_load - self.loads[j])
-                if w <= 0:
-                    violations[i].append("receiver_capacity_full")
-                    continue
-                proposals.append((i, j, meeting_node, w))
+        success = self._all_delivered()
+        if success:
+            reward += self.goal_reward
 
-        # 4) resolve proposals (move toward meeting node, transfer if co-located)
-        sharing_events = []
-        for (i, j, meeting_node, w) in proposals:
-            if self.positions[i] == meeting_node and self.positions[j] == meeting_node:
-                self.loads[i] -= w
-                self.loads[j] += w
-                sharing_events.append((i, j, meeting_node, w))
+        done = False
+        truncated = False
+        if success:
+            done = True
+        if self.t >= self.max_steps:
+            done = True
+            truncated = True
+        if np.any(self.battery < 0.0):
+            done = True
+
+        for i in range(self.num_robots):
+            self.battery_history[i].append(self.battery[i])
+            self.load_history[i].append(self.load[i])
+
+        if np.all(self.inventory == 0) and np.all(self.load == 0):
+            self.delivered_count += 1
+
+        if self.phase >= 2:
+            self._update_forecasts_and_flags()
+
+        obs = self._encode_obs()
+        info = {"masks": self._compute_masks(), "success": success}
+        return obs, reward, done, truncated, info
+
+    def _apply_movement(self, move):
+        next_pos = self.pos.copy()
+        collisions_this_step = 0
+        for i in range(self.num_robots):
+            d = MOVE_DIRS[int(move[i])]
+            nx = self.pos[i, 0] + d[0]
+            ny = self.pos[i, 1] + d[1]
+            if 0 <= nx < self.H and 0 <= ny < self.W:
+                next_pos[i] = (nx, ny)
             else:
-                self.positions[i] = self._step_towards(self.positions[i], meeting_node)
-                self.positions[j] = self._step_towards(self.positions[j], meeting_node)
-                if self.positions[i] == self.positions[j] == meeting_node:
-                    self.loads[i] -= w
-                    self.loads[j] += w
-                    sharing_events.append((i, j, meeting_node, w))
+                next_pos[i] = self.pos[i]
 
-        # 5) energy update and penalties
-        total_energy = 0.0
-        penalty = 0.0
-        for i in range(self.n):
-            d = abs(prev_positions[i][0] - self.positions[i][0]) + abs(prev_positions[i][1] - self.positions[i][1])
-            step_d = d if d > 0 else 1
-            e = self.a * (self.loads[i] ** 2) * step_d + self.b
-            self.batteries[i] -= e
-            total_energy += e
-            # forecast infeasibility
-            self.E_hat[i] = self._compute_energy_forecast(i)
-            if self.E_hat[i] > self.batteries[i]:
-                violations[i].append("forecast_infeasible")
-                penalty -= 10
-            if parsed[i]['move'] != 0 and prev_positions[i] == self.positions[i] and "collision" not in violations[i]:
-                violations[i].append("illegal_move_no_effect")
-                penalty -= 1
-            if self.positions[i] == prev_positions[i]:
-                self.stuck_counters[i] += 1
-            else:
-                self.stuck_counters[i] = 0
-            if self.stuck_counters[i] > 5:
-                violations[i].append("stuck")
-                penalty -= 3
+        for i in range(self.num_robots):
+            for j in range(i + 1, self.num_robots):
+                if np.array_equal(next_pos[i], next_pos[j]):
+                    collisions_this_step += 1
+                    next_pos[i] = self.pos[i]
+                    next_pos[j] = self.pos[j]
 
-        for i in range(self.n):
-            if self.batteries[i] < 0:
-                violations[i].append("battery_depleted")
-                penalty -= 50
+        self.collision_count += collisions_this_step
+        self.pos = next_pos
 
-        for idx in collisions:
-            penalty -= 5
+        for i in range(self.num_robots):
+            path = self.routes[i]
+            if len(path) > 0 and tuple(self.pos[i]) == path[0]:
+                self.routes[i] = path[1:]
 
-        reward = - total_energy + penalty
+        moved = np.any(next_pos != self.pos, axis=1).astype(np.float32)
+        energy = self.a * (self.load.astype(np.float32) ** 2) * moved + self.b * moved
+        return energy
 
-        all_items_delivered = all(v == 0 for v in self.inventory.values()) and all(self.loads[i] == 0 for i in range(self.n))
-        if all_items_delivered:
-            reward += 100
-            self.done = True
+    def _apply_sharing(self, offload, partner, meeting, amount, masks):
+        violations = 0
+        used_pairs = set()
+        for i in range(self.num_robots):
+            if offload[i] == 0:
+                continue
+            j = int(partner[i])
+            if j == i or j < 0 or j >= self.num_robots:
+                continue
+            M_idx = int(meeting[i])
+            M = (M_idx // self.W, M_idx % self.W)
+            w = int(amount[i])
+            if (i, j) in used_pairs or (j, i) in used_pairs:
+                continue
+            if self.phase >= 5:
+                if masks["partner"][i, j] == 0:
+                    violations += 1
+                    continue
+                if masks["meeting"][i, M_idx] == 0:
+                    violations += 1
+                    continue
+            if tuple(self.pos[i]) != M or tuple(self.pos[j]) != M:
+                continue
+            w = max(0, min(w, self.load[i]))
+            cap_j = self.max_load - self.load[j]
+            w = min(w, cap_j)
+            if w <= 0:
+                continue
+            self.load[i] -= w
+            self.load[j] += w
+            self.load_sharing_events.append((self.t, i, j, w))
+            used_pairs.add((i, j))
+        return violations
 
-        self.time_step += 1
-        if self.time_step >= self.max_steps:
-            self.done = True
+    def _auto_pick_drop(self):
+        for r in range(self.num_robots):
+            pr = tuple(self.pos[r])
+            for idx, sn in enumerate(self.storage_nodes):
+                if pr == sn and self.inventory[idx] > 0 and self.load[r] < self.max_load:
+                    can_take = min(self.max_load - self.load[r], self.inventory[idx])
+                    self.load[r] += can_take
+                    self.inventory[idx] -= can_take
+        for r in range(self.num_robots):
+            if tuple(self.pos[r]) == self.destination and self.load[r] > 0:
+                self.load[r] = 0
 
-        obs = self._get_obs()
-        info['state_vector'] = obs['state'].copy()
-        info['violations'] = violations
-        info['delivered'] = delivered
-        info['sharing_events'] = sharing_events
-        info['collisions'] = collisions
-        info['energy'] = total_energy
-        info['reward'] = float(reward)
-        return obs, float(reward), bool(self.done), info
+    def _all_delivered(self):
+        return np.all(self.inventory == 0) and np.all(self.load == 0)
+
+    def _update_forecasts_and_flags(self):
+        self.forecast = np.zeros(self.num_robots, dtype=np.float32)
+        for i in range(self.num_robots):
+            path = self.routes[i]
+            if len(path) == 0:
+                self.forecast[i] = 0.0
+                continue
+            L = len(path)
+            self.forecast[i] = np.sum(
+                self.a * (self.load[i] ** 2) * 1.0 + self.b
+                for _ in range(L)
+            )
+        self.offload_indicator = (self.forecast > self.beta * self.battery_budget).astype(np.float32)
+
+    def _compute_masks(self):
+        n = self.num_robots
+        movement = np.ones((n, self.num_move), dtype=np.float32)
+        partner = np.ones((n, self.num_partner), dtype=np.float32)
+        meeting = np.ones((n, self.num_meeting), dtype=np.float32)
+        amount = np.ones((n, self.num_amount), dtype=np.float32)
+
+        if self.phase < 4:
+            partner[:] = 0.0
+            meeting[:] = 0.0
+            amount[:] = 0.0
+
+        for i in range(n):
+            for m in range(self.num_move):
+                moved = 0.0 if m == 4 else 1.0
+                e_step = self.a * (self.load[i] ** 2) * moved + self.b * moved
+                if self.battery[i] - e_step < 0.0:
+                    movement[i, m] = 0.0
+
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    partner[i, j] = 0.0
+                else:
+                    if abs(self.pos[i, 0] - self.pos[j, 0]) + abs(self.pos[i, 1] - self.pos[j, 1]) > 2 * self.share_radius:
+                        partner[i, j] = 0.0
+
+        for i in range(n):
+            for idx in range(self.num_meeting):
+                mx = idx // self.W
+                my = idx % self.W
+                if abs(self.pos[i, 0] - mx) + abs(self.pos[i, 1] - my) > self.share_radius:
+                    meeting[i, idx] = 0.0
+
+        for i in range(n):
+            for w in range(self.num_amount):
+                if w > self.load[i]:
+                    amount[i, w] = 0.0
+
+        return {
+            "movement": movement,
+            "partner": partner,
+            "meeting": meeting,
+            "amount": amount,
+        }
+
+    def _count_violations(self, move, offload, partner, meeting, amount, masks):
+        v = 0
+        n = self.num_robots
+        for i in range(n):
+            if masks["movement"][i, move[i]] == 0:
+                v += 1
+            if self.phase >= 4:
+                if offload[i] == 1:
+                    if masks["partner"][i, partner[i]] == 0:
+                        v += 1
+                    if masks["meeting"][i, meeting[i]] == 0:
+                        v += 1
+                    if masks["amount"][i, amount[i]] == 0:
+                        v += 1
+        return v
+
+    def _encode_obs(self):
+        feats = []
+        def norm_coord(x, maxv):
+            return 2.0 * (x / (maxv - 1 + 1e-8)) - 1.0
+
+        for i in range(self.num_robots):
+            x, y = self.pos[i]
+            feats.extend([
+                norm_coord(x, self.H),
+                norm_coord(y, self.W),
+                self.load[i] / (self.max_load + 1e-8),
+                self.battery[i] / (self.battery_budget + 1e-8),
+                self.forecast[i] / (self.battery_budget * 4.0 + 1e-8) if self.phase >= 2 else 0,
+                self.offload_indicator[i] if self.phase >= 2 else 0.0,
+            ])
+        for k in range(len(self.storage_nodes)):
+            feats.append(self.inventory[k] / (self.init_inventory[k] + 1e-8))
+        feats.append(norm_coord(self.destination[0], self.H))
+        feats.append(norm_coord(self.destination[1], self.W))
+        return np.array(feats, dtype=np.float32)
+
+    def render(self):
+        grid = [["." for _ in range(self.W)] for _ in range(self.H)]
+        dx, dy = self.destination
+        grid[dx][dy] = "D"
+        for idx, s in enumerate(self.storage_nodes):
+            x, y = s
+            grid[x][y] = "S"
+        for i in range(self.num_robots):
+            x, y = self.pos[i]
+            grid[x][y] = str(i)
+        print(f"Step {self.t}")
+        for row in grid:
+            print(" ".join(row))
+        print(f"Load: {self.load}, Battery: {self.battery}")
