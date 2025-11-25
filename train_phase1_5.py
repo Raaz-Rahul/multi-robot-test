@@ -218,20 +218,22 @@ def main():
 
         print(f"step={global_step} phase={current_phase} avgR={np.mean(episode_rewards[-10:]):.2f}")
 
-    # Plot after training ends
+    # After training ends
     plt.figure()
     plt.plot(episode_rewards)
     plt.title("Episode Rewards")
     plt.xlabel("Episode")
     plt.ylabel("Total Reward")
-    plt.show()
+    plt.savefig("reward_curve.png")  # SAVE instead of only show
+    plt.close()
 
     plt.figure()
     plt.plot(episode_collision_counts)
     plt.title("Collisions per Episode")
     plt.xlabel("Episode")
     plt.ylabel("Collision Count")
-    plt.show()
+    plt.savefig("collision_counts.png")
+    plt.close()
 
     plt.figure()
     for i in range(env.num_robots):
@@ -241,7 +243,8 @@ def main():
     plt.xlabel("Step")
     plt.ylabel("Battery")
     plt.legend()
-    plt.show()
+    plt.savefig("battery_levels.png")
+    plt.close()
 
     plt.figure()
     for i in range(env.num_robots):
@@ -251,7 +254,9 @@ def main():
     plt.xlabel("Step")
     plt.ylabel("Load")
     plt.legend()
-    plt.show()
+    plt.savefig("load_levels.png")
+    plt.close()
+
 
     total_sharing = sum(len(ev) for ev in episode_load_sharing)
     print(f"Total load sharing events during training: {total_sharing}")
