@@ -5,7 +5,8 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 from env_multi_robot import MultiRobotEnv
-from policy import CentralizedPolicy
+from policy1_5 import CentralizedPolicy
+
 
 
 def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
