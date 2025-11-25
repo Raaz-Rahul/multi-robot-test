@@ -133,11 +133,12 @@ class MultiRobotEnv(gym.Env):
 
     def step(self, action):
         self.t += 1
-        move = np.array(action["move"], dtype=np.int64)
-        offload = np.array(action["offload"], dtype=np.int64)
-        partner = np.array(action["partner"], dtype=np.int64)
-        meeting = np.array(action["meeting"], dtype=np.int64)
-        amount = np.array(action["amount"], dtype=np.int64)
+        move = action["move"].detach().cpu().numpy().astype(np.int64)
+        offload = action["offload"].detach().cpu().numpy().astype(np.int64)
+        partner = action["partner"].detach().cpu().numpy().astype(np.int64)
+        meeting = action["meeting"].detach().cpu().numpy().astype(np.int64)
+        amount = action["amount"].detach().cpu().numpy().astype(np.int64)
+
 
         masks = self._compute_masks()
 
